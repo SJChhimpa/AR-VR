@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Abyssal Rover: Teleoperation HUD</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- CDN imports: A-Frame 1.5.0 + environment component (sky / distant rock dressing) -->
+<script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/aframe-environment-component@1.3.2/dist/aframe-environment-component.min.js"></script>
+<style>
+  body { margin: 0; background: #00121e; }
+  #hint { position: fixed; left: 12px; bottom: 56px; z-index: 5; max-width: 330px; padding: 8px 10px;
+          font: 12px/1.5 system-ui, sans-serif; color: #8fe3f2; background: rgba(0,18,30,.75);
+          border: 1px solid #0c5a6e; border-radius: 6px; pointer-events: none; }
+</style>
+<script>
+/* ============================================================
+   1. CUSTOM SHADER: head-locked "camera feed" filter overlay
+   Tint + vignette + scanlines (+ grain for night vision).
+   ============================================================ */
+AFRAME.registerShader('feedfx', {
+  schema: {
+    time:     { type: 'time',   is: 'uniform' },
+    tint:     { type: 'color',  is: 'uniform', default: '#18ff9a' },
+    strength: { type: 'number', is: 'uniform', default: 0.5 },
+    mode:     { type: 'number', is: 'uniform', default: 0 }
+  },
+  vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+  fragmentShader: [
+    'uniform float time; uniform vec3 tint; uniform float strength; uniform float mode; varying vec2 vUv;',
+    'float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }',
+    'void main(){',
+    '  float vig  = smoothstep(0.22, 0.72, length(vUv - 0.5));',
+    '  float scan = 0.5 + 0.5 * sin(vUv.y * 320.0 + time * 0.004);',
+    '  float grain = (mode > 1.5 && mode < 2.5) ? hash(vUv * vec2(900.0, 500.0) + floor(time * 0.03)) * 0.14 : 0.0;',
+    '  float a = strength * (0.10 + 0.30 * vig + 0.07 * scan) + grain * strength;',
+    '  gl_FragColor = vec4(tint, clamp(a, 0.0, 0.85));',
+    '}'
+  ].join('\n')
+});
+
+/* ============================================================
+   2. MAIN COMPONENT: builds the world, cockpit, rover and logic
+   ============================================================ */
+AFRAME.registerComponent('abyss', {
+  init: function () {
+    const THREE = AFRAME.THREE, scene = this.el.sceneEl, app = this.el;
+    const $ = (s) => document.querySelector(s);
+    const rig = $('#rig'), cam = $('#camera'), lhand = $('#lhand'), rhand = $('#rhand');
+
+    // Tiny DOM helper: create an entity/primitive, set attributes, append.
+    const E = (p, tag, a = {}) => { const e = document.createElement(tag);
+      for (const k in a) e.setAttribute(k, a[k]); p.appendChild(e); return e; };
+    // Seeded RNG so the seabed is identical on every load.
+    let seed = 7; const R = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+
+    // Shared simulation state.
+    const S = { yaw: 0, elev: 0, baseDepth: 3850, depth: 3850, lx: 0, ly: 0, rx: 0, ry: 0,
+                mode: 0, lights: true, hud: true, link: 300 };
+    const FEATURES = [];                       // seabed features, also plotted on sonar
+    const RANGE = 12;                          // sonar range in metres
+
+    /* ---------- Environment: dark gradient sky + distant stone dressing ---------- */
+    E(app, 'a-entity', { environment: 'preset: none; skyType: gradient; skyColor: #00121e; horizonColor: #00293b; ' +
+      'lighting: none; fog: 0; ground: none; dressing: stones; dressingAmount: 70; dressingColor: #0a2f3c; ' +
+      'dressingScale: 5; dressingVariance: 3 3 3; dressingOnPlayArea: 0; playArea: 2' });
+
+    /* ---------- Lighting (kept light for Quest: 1 ambient + 1 dir + 2 rover spots + 3 vent points) ---------- */
+    const amb = E(app, 'a-entity', { light: 'type: ambient; color: #2a6e86; intensity: 0.55' });
+    E(app, 'a-entity', { light: 'type: directional; color: #4aa3c0; intensity: 0.25', position: '1 6 2' });
+
+    /* ---------- Sea floor: displaced terrain with sediment texture, survey grid, sculpted rocks ---------- */
+    const vn = (x, z) => Math.sin(x * 0.35 + Math.cos(z * 0.27) * 1.7) * 0.5 + Math.sin(z * 0.21 - x * 0.13 + 1.3) * 0.35 + Math.sin((x + z) * 0.9) * 0.15;
+    // Height function: nearly flat around the work area, rolling dunes further out. Rocks and worms sit on it.
+    const H = (x, z) => { const k = Math.min(1, Math.max(0, (Math.hypot(x, z + 6) - 9) / 14)); return vn(x, z) * (0.03 + k * k * 1.6); };
+    const tc = document.createElement('canvas'); tc.width = tc.height = 128;
+    const tx = tc.getContext('2d'), img = tx.createImageData(128, 128);
+    for (let i = 0; i < 16384; i++) { const x = i % 128, y = (i / 128) | 0,
+      b = 0.6 + 0.25 * Math.sin(x * 0.3 + Math.sin(y * 0.2) * 3) * Math.sin(y * 0.17) + (Math.random() - 0.5) * 0.3;
+      img.data.set([62 * b, 78 * b, 82 * b, 255], i * 4); }
+    tx.putImageData(img, 0, 0);
+    const sed = new THREE.CanvasTexture(tc); sed.wrapS = sed.wrapT = THREE.RepeatWrapping; sed.repeat.set(40, 40);
+    const tgeo = new THREE.PlaneGeometry(120, 120, 90, 90); tgeo.rotateX(-Math.PI / 2);
+    const tpos = tgeo.attributes.position; for (let i = 0; i < tpos.count; i++) tpos.setY(i, H(tpos.getX(i), tpos.getZ(i)));
+    tgeo.computeVertexNormals();
+    app.object3D.add(new THREE.Mesh(tgeo, new THREE.MeshStandardMaterial({ map: sed, roughness: 1, metalness: 0 })));
+    const grid = new THREE.GridHelper(24, 24, 0x0f7f99, 0x07404f);          // faint survey grid around the work area
+    grid.position.set(0, 0.08, -6); grid.material.transparent = true; grid.material.opacity = 0.2; app.object3D.add(grid);
+
+    const rockMat = new THREE.MeshStandardMaterial({ color: 0x24444f, roughness: 1, flatShading: true });
+    for (let i = 0; i < 22; i++) {
+      const a = R() * 6.283, d = 3.5 + R() * 9, x = Math.cos(a) * d, z = -7 + Math.sin(a) * d;
+      if (Math.hypot(x, z) < 5) continue;                                  // keep clear of the platform
+      const s = 0.3 + R() * 0.9, g = new THREE.IcosahedronGeometry(1, 2), p = g.attributes.position;
+      for (let j = 0; j < p.count; j++) { const px = p.getX(j), py = p.getY(j), pz = p.getZ(j),
+        n = 1 + 0.28 * Math.sin(px * 3.1 + py * 2.3) * Math.cos(pz * 2.7 + px + i) + 0.12 * Math.sin(py * 7 + pz * 5);
+        p.setXYZ(j, px * n, py * n * 0.7, pz * n); }                       // lumpy, irregular boulders
+      g.computeVertexNormals();
+      const m = new THREE.Mesh(g, rockMat); m.position.set(x, H(x, z) + s * 0.25, z);
+      m.scale.set(s, s * (0.6 + R() * 0.6), s * (0.8 + R() * 0.5)); m.rotation.y = R() * 6.28;
+      app.object3D.add(m); FEATURES.push({ x, z, type: 'rock' });
+    }
+    const VENTS = [[-4, -9.5], [3.8, -10.2], [5.5, -5.6]];
+    VENTS.forEach(([x, z]) => {
+      E(app, 'a-cone', { position: `${x} 0.55 ${z}`, 'radius-bottom': 0.5, 'radius-top': 0.17, height: 1.1,
+        material: 'color: #1a1410; roughness: 1; flatShading: true' });
+      E(app, 'a-circle', { position: `${x} 1.11 ${z}`, rotation: '-90 0 0', radius: 0.16, material: 'shader: flat; color: #ff7a3a' });
+      E(app, 'a-entity', { position: `${x} 1.4 ${z}`, light: 'type: point; color: #ff7a3a; intensity: 0.9; distance: 5' });
+      FEATURES.push({ x, z, type: 'vent' });
+    });
+
+    /* ---------- Particles: marine snow, bioluminescent motes, vent plumes ---------- */
+    const cv = document.createElement('canvas'); cv.width = cv.height = 64;
+    const cx = cv.getContext('2d'), gr = cx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(0.4, 'rgba(255,255,255,.35)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+    cx.fillStyle = gr; cx.fillRect(0, 0, 64, 64);
+    const SPRITE = new THREE.CanvasTexture(cv);
+    const sets = [];
+    const particles = (n, box, center, color, size, vy, wob, opacity) => {
+      const pos = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) { pos[i*3] = (R()-.5)*box[0]; pos[i*3+1] = (R()-.5)*box[1]; pos[i*3+2] = (R()-.5)*box[2]; }
+      const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      const mat = new THREE.PointsMaterial({ color, size, map: SPRITE, transparent: true, opacity, depthWrite: false,
+        blending: THREE.AdditiveBlending, sizeAttenuation: true });
+      const pts = new THREE.Points(geo, mat); pts.position.set(...center); pts.frustumCulled = false;
+      app.object3D.add(pts); const set = { pts, geo, pos, n, h: box[1], vy, wob, base: opacity }; sets.push(set); return set;
+    };
+    particles(700, [34, 14, 34], [0, 6, -6], 0xcfeaff, 0.05, -0.18, 0.1, 0.55);        // marine snow
+    const bio = [particles(220, [30, 6, 30], [0, 2.5, -5], 0x35ffe0, 0.17, 0.03, 0.18, 0.9),
+                 particles(90,  [30, 6, 30], [0, 2.5, -5], 0xb36bff, 0.2, 0.02, 0.18, 0.9)]; // bioluminescence
+    VENTS.forEach(([x, z]) => particles(60, [0.7, 3, 0.7], [x, 2.6, z], 0xff9a60, 0.22, 0.6, 0.4, 0.35)); // plumes
+
+    // Backscatter: bright particles caught in the rover's beams, and sediment stirred up under it (both follow the rover).
+    particles(350, [9, 5, 9], [0, 0, 0], 0xdfffff, 0.045, -0.05, 0.05, 0.7).follow = { dz: -2.5 };
+    particles(120, [3, 1.4, 3], [0, 0, 0], 0xb7a58a, 0.2, 0.12, 0.2, 0.3).follow = { y: 0.6 };
+
+    /* ---------- Marine life: fish schools, jellyfish, anglerfish, tube worms ---------- */
+    const lifeTick = [];                                   // per-frame updaters, run from the main loop
+    const dummy = new THREE.Object3D();
+    { // Tube worm colonies around each vent (one InstancedMesh = one draw call)
+      const g = new THREE.CylinderGeometry(0.02, 0.035, 1, 5); g.translate(0, 0.5, 0);
+      const m = new THREE.InstancedMesh(g, new THREE.MeshStandardMaterial({ color: 0xe8e0d8, emissive: 0x3a0c0c, roughness: 0.6 }), VENTS.length * 18);
+      let n = 0;
+      VENTS.forEach(([x, z]) => { for (let i = 0; i < 18; i++) { const a = R() * 6.283, d = 0.6 + R() * 0.7;
+        dummy.position.set(x + Math.cos(a) * d, H(x, z), z + Math.sin(a) * d);
+        dummy.rotation.set((R() - 0.5) * 0.5, 0, (R() - 0.5) * 0.5); dummy.scale.set(1, 0.3 + R() * 0.6, 1);
+        dummy.updateMatrix(); m.setMatrixAt(n++, dummy.matrix); } });
+      app.object3D.add(m);
+    }
+    // Fish: a flattened cone (nose along +x). Each school is one InstancedMesh following a looping path,
+    // with per-fish wander, heading taken from the path tangent, and a tail-wag yaw.
+    const fishGeo = new THREE.ConeGeometry(0.2, 1, 6); fishGeo.rotateZ(-Math.PI / 2); fishGeo.scale(1, 1, 0.4);
+    const school = (n, c, rad, y, spd, size, mat) => {
+      const m = new THREE.InstancedMesh(fishGeo, mat, n); m.frustumCulled = false; app.object3D.add(m);
+      const f = Array.from({ length: n }, () => ({ o: [(R() - .5) * 2.4, (R() - .5) * 1.2, (R() - .5) * 2.4], ph: R() * 6.28, fr: 0.4 + R() * 0.6, s: size * (0.8 + R() * 0.4) }));
+      const feat = { x: c[0], z: c[1], type: 'life' }; FEATURES.push(feat);   // shows on sonar as a moving blip
+      const at = (i, t) => { const q = f[i], u = t * 0.001 * spd;
+        const cx = c[0] + Math.sin(u) * rad, cz = c[1] + Math.cos(u * 0.8 + 1) * rad, cy = y + Math.sin(u * 0.5) * 0.8;
+        return [cx + q.o[0] + Math.sin(u * q.fr * 3 + q.ph) * 0.5, cy + q.o[1] + Math.sin(u * 2 + q.ph) * 0.2, cz + q.o[2] + Math.cos(u * q.fr * 3 + q.ph) * 0.5]; };
+      lifeTick.push(t => {
+        for (let i = 0; i < n; i++) { const p = at(i, t), p2 = at(i, t + 120), q = f[i];
+          dummy.position.set(p[0], p[1], p[2]);
+          dummy.rotation.set(0, Math.atan2(-(p2[2] - p[2]), p2[0] - p[0]) + Math.sin(t * 0.012 * q.fr + q.ph) * 0.25, 0);
+          dummy.scale.setScalar(q.s); dummy.updateMatrix(); m.setMatrixAt(i, dummy.matrix); }
+        m.instanceMatrix.needsUpdate = true;
+        feat.x = c[0] + Math.sin(t * 0.001 * spd) * rad; feat.z = c[1] + Math.cos(t * 0.001 * spd * 0.8 + 1) * rad; });
+    };
+    school(45, [-2, -5], 5, 2.8, 0.45, 0.3, new THREE.MeshStandardMaterial({ color: 0xcfe0e8, metalness: 0.7, roughness: 0.3, emissive: 0x0a1a22 }));   // silvery shoal
+    school(26, [4, -9], 3.5, 1.2, 0.35, 0.5, new THREE.MeshStandardMaterial({ color: 0x8a4a38, metalness: 0.3, roughness: 0.5, emissive: 0x1a0805 })); // bottom-dwellers
+    school(30, [0, -13], 4, 4.2, 0.55, 0.2, new THREE.MeshBasicMaterial({ color: 0x35ffe0 }));                                                       // glowing lanternfish
+
+    // Jellyfish: additive translucent bell that pulses, trailing tentacles that sway, slow looping drift.
+    const jellyMats = [];
+    for (let i = 0; i < 9; i++) {
+      const mat = new THREE.MeshBasicMaterial({ color: [0x4cf2ff, 0xc07bff, 0xff7bd0][i % 3], transparent: true, opacity: 0.5,
+        blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+      mat.userData.base = 0.5; jellyMats.push(mat);
+      const g = new THREE.Group(), bell = new THREE.Mesh(new THREE.SphereGeometry(0.3, 12, 8, 0, 6.283, 0, 1.57), mat), tents = [];
+      g.add(bell);
+      for (let k = 0; k < 7; k++) { const tgm = new THREE.CylinderGeometry(0.008, 0.002, 1, 3); tgm.translate(0, -0.5, 0);
+        const tn = new THREE.Mesh(tgm, mat); tn.position.set(Math.cos(k * 0.898) * 0.2, 0, Math.sin(k * 0.898) * 0.2); g.add(tn); tents.push(tn); }
+      const sz = 0.7 + R() * 0.9, bx = (R() - 0.5) * 18, bz = -4 - R() * 12, by = 1.5 + R() * 3.5, ph = R() * 6.28;
+      app.object3D.add(g);
+      lifeTick.push(t => { const u = t * 0.001, pl = Math.sin(u * 1.6 + ph);
+        g.position.set(bx + Math.sin(u * 0.12 + ph) * 2, by + Math.sin(u * 0.3 + ph) + pl * 0.08, bz + Math.cos(u * 0.1 + ph) * 2);
+        bell.scale.set(1 - pl * 0.1, 1 + pl * 0.2, 1 - pl * 0.1); g.scale.setScalar(sz);
+        tents.forEach((q, k) => q.rotation.set(Math.sin(u + k) * 0.15, 0, Math.cos(u * 1.2 + k) * 0.15)); });
+    }
+    { // Anglerfish with a pulsing lure, patrolling near the rover
+      const g = new THREE.Group(), dark = new THREE.MeshStandardMaterial({ color: 0x2a201c, roughness: 0.6 });
+      const body = new THREE.Mesh(new THREE.SphereGeometry(0.35, 12, 8), dark); body.scale.set(1.2, 0.9, 0.8);
+      const tail = new THREE.Mesh(new THREE.ConeGeometry(0.2, 0.7, 6), dark); tail.rotation.z = Math.PI / 2; tail.position.x = -0.6; tail.scale.z = 0.4;
+      const stalk = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.008, 0.6, 4), dark); stalk.position.set(0.5, 0.45, 0); stalk.rotation.z = -0.9;
+      const lure = new THREE.Mesh(new THREE.SphereGeometry(0.05, 8, 8), new THREE.MeshBasicMaterial({ color: 0xbfffee })); lure.position.set(0.75, 0.68, 0);
+      const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: SPRITE, color: 0x7dffd0, blending: THREE.AdditiveBlending, transparent: true, depthWrite: false }));
+      glow.scale.setScalar(0.9); glow.position.copy(lure.position);
+      g.add(body, tail, stalk, lure, glow);
+      [-1, 1].forEach(sd => { const e = new THREE.Mesh(new THREE.SphereGeometry(0.05, 6, 6), new THREE.MeshBasicMaterial({ color: 0xffffff })); e.position.set(0.3, 0.1, sd * 0.22); g.add(e); });
+      g.scale.setScalar(1.4); app.object3D.add(g);
+      const feat = { x: 3, z: -9, type: 'life' }; FEATURES.push(feat);
+      lifeTick.push(t => { const u = t * 0.0003, x = 3 + Math.cos(u) * 3, z = -9.5 + Math.sin(u) * 2.5;
+        g.position.set(x, 1.5 + Math.sin(u * 2) * 0.2, z); g.rotation.y = Math.atan2(-Math.cos(u) * 2.5, -Math.sin(u) * 3);
+        glow.material.opacity = 0.7 + 0.3 * Math.sin(t * 0.004); feat.x = x; feat.z = z; });
+    }
+    // Soft blob shadow under the rover (cheap stand-in for real shadow maps on Quest).
+    const shadow = new THREE.Mesh(new THREE.CircleGeometry(1.6, 24), new THREE.MeshBasicMaterial({ map: SPRITE, color: 0x000000, transparent: true, opacity: 0.7, depthWrite: false }));
+    shadow.rotation.x = -Math.PI / 2; shadow.position.y = 0.07; app.object3D.add(shadow);
+
+    /* ---------- Command platform (user stands here, rig sits at y=0.2) ---------- */
+    E(app, 'a-cylinder', { radius: 3.2, height: 0.2, position: '0 0.1 0', material: 'color: #16252d; metalness: .7; roughness: .5' });
+    E(app, 'a-torus', { radius: 3.1, 'radius-tubular': 0.03, rotation: '90 0 0', position: '0 0.21 0', material: 'shader: flat; color: #27d3f0' });
+    E(app, 'a-torus', { radius: 3.0, 'radius-tubular': 0.025, rotation: '90 0 0', position: '0 1.0 0', material: 'color: #2d4450; metalness: .8' });
+    for (let i = 0; i < 10; i++) { const a = i * 0.6283;
+      E(app, 'a-cylinder', { radius: 0.025, height: 0.8, position: `${Math.sin(a)*3} 0.6 ${-Math.cos(a)*3}`, material: 'color: #2d4450; metalness: .8' }); }
+
+    /* ---------- Rover from primitives ---------- */
+    const rover = E(app, 'a-entity', { id: 'rover', position: '0 2.2 -7' });
+    const body = E(rover, 'a-entity');
+    const box = (p, pos, sz, color) => E(p, 'a-box', { position: pos, width: sz[0], height: sz[1], depth: sz[2],
+      material: `color: ${color}; metalness: .5; roughness: .5` });
+    box(body, '0 0 0', [2, 0.5, 1.3], '#2a3a45');                    // chassis
+    box(body, '0 0.32 0', [1.6, 0.16, 1], '#ffb020'); // safety-yellow top shell
+    box(body, '-0.7 -0.4 0', [0.1, 0.1, 1.5], '#16222a'); box(body, '0.7 -0.4 0', [0.1, 0.1, 1.5], '#16222a'); // skids
+    E(body, 'a-sphere', { radius: 0.3, 'theta-length': 90, position: '0 0.4 0.1',                                // sensor dome
+      material: 'shader: flat; color: #2ff; opacity: .55; transparent: true; side: double',
+      animation: 'property: components.material.material.opacity; from: .35; to: .8; dir: alternate; dur: 1400; loop: true; easing: easeInOutSine' });
+    box(body, '-0.6 0.6 0.3', [0.03, 0.55, 0.03], '#c9d3da');                                              // antenna
+    E(body, 'a-sphere', { radius: 0.05, position: '-0.6 0.9 0.3', material: 'shader: flat; color: #f33; transparent: true',
+      animation: 'property: components.material.material.opacity; from: 1; to: .1; dir: alternate; dur: 600; loop: true' }); // beacon
+    E(body, 'a-cylinder', { radius: 0.12, height: 0.1, position: '0 0.05 -0.66', rotation: '90 0 0', material: 'color: #05161c; metalness: .9; roughness: .1' });
+    E(body, 'a-circle', { radius: 0.07, position: '0 0.05 -0.711', material: 'shader: flat; color: #2a7fff' });         // camera lens
+    [[-1, -1], [1, -1], [-1, 1], [1, 1]].forEach(([sx, sz]) => {      // 4 vertical thrusters with spinning rotors
+      const t = E(body, 'a-entity', { position: `${sx * 0.95} 0.15 ${sz * 0.6}` });
+      E(t, 'a-cylinder', { radius: 0.24, height: 0.3, 'open-ended': true, material: 'color: #1c2830; metalness: .7; side: double' });
+      E(t, 'a-box', { width: 0.4, height: 0.02, depth: 0.05, material: 'color: #9fb4c0',
+        animation: 'property: rotation; to: 0 360 0; loop: true; dur: 250; easing: linear' });
+      E(t, 'a-circle', { position: '0 -0.17 0', rotation: '-90 0 0', radius: 0.2, material: 'shader: flat; color: #3ff; opacity: .45; transparent: true' });
+    });
+    [-0.45, 0.45].forEach(x => E(body, 'a-cylinder', { position: `${x} 0.02 0.78`, rotation: '90 0 0', radius: 0.17, height: 0.3,
+      material: 'color: #1c2830; metalness: .7' }));                    // rear main thrusters
+    // Robotic arm: shoulder -> upper arm -> elbow -> forearm -> two-jaw claw (all animated)
+    const sh = E(body, 'a-entity', { position: '0 -0.28 -0.66',
+      animation: 'property: rotation; from: -10 0 0; to: 35 0 0; dir: alternate; dur: 3800; loop: true; easing: easeInOutSine' });
+    E(sh, 'a-sphere', { radius: 0.12, material: 'color: #c9d3da; metalness: .6' }); box(sh, '0 0 -0.35', [0.12, 0.12, 0.7], '#ffb020');
+    const elb = E(sh, 'a-entity', { position: '0 0 -0.7',
+      animation: 'property: rotation; from: 20 0 0; to: -30 0 0; dir: alternate; dur: 2900; loop: true; easing: easeInOutSine' });
+    E(elb, 'a-sphere', { radius: 0.09, material: 'color: #c9d3da; metalness: .6' }); box(elb, '0 0 -0.3', [0.09, 0.09, 0.6], '#c9d3da');
+    const wr = E(elb, 'a-entity', { position: '0 0 -0.6' });
+    [-1, 1].forEach(s => { const j = E(wr, 'a-entity', { position: `${s * 0.05} 0 0`,
+      animation: `property: rotation; from: 0 0 0; to: 0 ${-s * 28} 0; dir: alternate; dur: 1100; loop: true; easing: easeInOutSine` });
+      box(j, '0 0 -0.1', [0.03, 0.05, 0.22], '#ff6a2a'); });
+    // Spotlights: a real spot light plus a faint additive cone so the beam is visible in the water
+    const lamps = [];
+    [['L', -1], ['R', 1]].forEach(([id, sx]) => {
+      const lamp = E(body, 'a-entity', { position: `${sx * 0.6} 0.05 -0.7`, rotation: '-10 0 0' });
+      E(lamp, 'a-cylinder', { radius: 0.09, height: 0.12, rotation: '90 0 0', material: 'shader: flat; color: #fff' });
+      E(lamp, 'a-entity', { id: 'tgt' + id, position: '0 0 -5' });
+      const light = E(lamp, 'a-entity', { light: `type: spot; color: #cfefff; intensity: 2.4; angle: 30; penumbra: .6; distance: 25; decay: 1; target: #tgt${id}` });
+      const cone = E(lamp, 'a-cone', { position: '0 0 -3.2', rotation: '-90 0 0', 'radius-top': 1, 'radius-bottom': 0.04, height: 6.4,
+        'open-ended': true, material: 'shader: flat; color: #aeeaff; opacity: .10; transparent: true; side: double; depthWrite: false; blending: additive' });
+      lamps.push(light, cone);
+    });
+
+    /* ---------- Text / panel / button helpers ---------- */
+    const T = (p, value, x, y, o = {}) => E(p, 'a-entity', { position: `${x} ${y} 0.004`,
+      text: { value, width: o.w || 1, wrapCount: o.wrap || 30, color: o.c || '#bff6ff', align: o.a || 'left',
+              anchor: o.a || 'left', baseline: 'center', font: o.f || 'exo2semibold' } });
+    const setText = (e, v) => e.setAttribute('text', 'value', v);
+    // Console panels sit on an arc around the user (angle in degrees, 0 = straight ahead).
+    const panel = (ang, y, tilt, w, h, title) => {
+      const r = 1.75, a = ang * Math.PI / 180;
+      const g = E(app, 'a-entity', { position: `${r * Math.sin(a)} ${y} ${-r * Math.cos(a)}`, rotation: `${tilt} ${-ang} 0` });
+      E(g, 'a-plane', { width: w + 0.04, height: h + 0.04, position: '0 0 -0.003', material: 'shader: flat; color: #27d3f0; opacity: .35; transparent: true' });
+      E(g, 'a-plane', { width: w, height: h, material: 'shader: flat; color: #001824; opacity: .74; transparent: true' });
+      T(g, title, -w / 2 + 0.05, h / 2 - 0.07, { w: 0.9, c: '#6fe4f7' });
+      return g;
+    };
+    const bar = (p, x, y, w, color) => {                              // progress bar: track + scalable fill
+      E(p, 'a-plane', { width: w, height: 0.03, position: `${x} ${y} 0.002`, material: 'shader: flat; color: #0a2f3c' });
+      const f = E(p, 'a-plane', { width: w, height: 0.03, position: `${x} ${y} 0.004`, material: `shader: flat; color: ${color}` });
+      f.fillX = x; f.fillW = w; return f;
+    };
+    const setBar = (f, v) => { v = Math.max(0.001, Math.min(1, v)); f.object3D.scale.x = v; f.object3D.position.x = f.fillX - f.fillW / 2 + f.fillW * v / 2; };
+
+    /* ---------- Telemetry panel (left): depth + pressure ---------- */
+    const tp = panel(-48, 1.5, -8, 1.1, 1.0, 'Rover telemetry');
+    T(tp, 'Depth', -0.5, 0.28, { c: '#6fa9b8', w: 0.5 });
+    const tDepth = T(tp, '3,850 m', -0.5, 0.14, { w: 1.0, wrap: 11, f: 'sourcecodepro', c: '#e8fdff' });
+    const bDepth = bar(tp, 0, 0.02, 1.0, '#27d3f0');
+    T(tp, 'Hull pressure', -0.5, -0.08, { c: '#6fa9b8', w: 0.6 });
+    const tPress = T(tp, '', -0.5, -0.19, { w: 1.0, wrap: 22, f: 'sourcecodepro', c: '#e8fdff' });
+    const bPress = bar(tp, 0, -0.29, 1.0, '#ffb020');
+    const tHead = T(tp, '', -0.5, -0.38, { w: 1.0, wrap: 26, f: 'sourcecodepro', c: '#8fe3f2' });
+    const tStat = T(tp, '', -0.5, -0.45, { w: 1.0, wrap: 26, f: 'sourcecodepro', c: '#8fe3f2' });
+
+    /* ---------- Sonar panel (right): ping rings + sweep + blips ---------- */
+    const sp = panel(48, 1.5, -8, 1.1, 1.0, 'Sonar');
+    const sc = E(sp, 'a-entity', { position: '0 -0.04 0.004' });
+    E(sc, 'a-circle', { radius: 0.4, material: 'shader: flat; color: #021a14' });
+    [0.13, 0.26, 0.4].forEach(r => E(sc, 'a-ring', { 'radius-inner': r - 0.003, 'radius-outer': r, material: 'shader: flat; color: #1f8f6a' }));
+    const sweep = E(sc, 'a-circle', { radius: 0.4, 'theta-length': 30, position: '0 0 0.001', material: 'shader: flat; color: #3dffb0; opacity: .3; transparent: true' });
+    const rings = [0, 1].map(() => E(sc, 'a-ring', { 'radius-inner': 0.97, 'radius-outer': 1, visible: false, position: '0 0 0.002',
+      material: 'shader: flat; color: #7dffd0; transparent: true' }));
+    rings.forEach(r => r.age = -1);
+    const blips = FEATURES.map(f => { const b = E(sc, 'a-circle', { radius: f.type === 'vent' ? 0.026 : f.type === 'life' ? 0.022 : 0.017, position: '0 0 0.003',
+      material: `shader: flat; color: ${f.type === 'vent' ? '#ff9a60' : f.type === 'life' ? '#6fe8ff' : '#8fffb0'}; opacity: 0; transparent: true` }); b.hit = -9999; b.f = f; return b; });
+    E(sc, 'a-triangle', { 'vertex-a': '0 0.03 0', 'vertex-b': '-0.02 -0.02 0', 'vertex-c': '0.02 -0.02 0', position: '0 0 0.004', material: 'shader: flat; color: #ffb020' }); // rover marker
+    T(sp, 'Range 12 m, rover-relative', -0.5, -0.45, { c: '#6fa9b8', w: 0.8 });
+
+    /* ---------- Feed panel (centre desk): filter + control buttons ---------- */
+    const fp = panel(0, 0.95, -38, 1.8, 0.8, 'Live rover feed');
+    const tFeed = T(fp, '', -0.85, 0.22, { w: 1.2, wrap: 26, f: 'sourcecodepro', c: '#e8fdff' });
+    const tDesc = T(fp, '', -0.85, 0.15, { w: 1.5, wrap: 48, f: 'sourcecodepro', c: '#6fa9b8' });
+    const rec = E(fp, 'a-circle', { radius: 0.025, position: '0.82 0.34 0.004', material: 'shader: flat; color: #ff3b3b; transparent: true',
+      animation: 'property: components.material.material.opacity; from: 1; to: .15; dir: alternate; dur: 700; loop: true' });
+    T(fp, 'Right stick: turn rover, raise / lower   Grip: next filter   A: ping   B: lights', -0.85, -0.37, { w: 1.7, wrap: 62, f: 'sourcecodepro', c: '#4f8794' });
+
+    const MODES = [
+      { name: 'Standard',     tint: '#000000', str: 0,    k: 0, fog: '#00121e', dens: 0.08, amb: 0.55, bio: 1,   desc: 'Natural-light camera' },
+      { name: 'Sonar mode',   tint: '#10ff90', str: 0.75, k: 1, fog: '#001a0e', dens: 0.07, amb: 0.15, bio: 0.2, desc: 'Acoustic render, green phosphor' },
+      { name: 'Night vision', tint: '#3dff3d', str: 0.6,  k: 2, fog: '#031a03', dens: 0.05, amb: 1.6,  bio: 0.4, desc: 'Amplified low-light, long range' },
+      { name: 'Bio-lume',     tint: '#9b5bff', str: 0.3,  k: 3, fog: '#05001e', dens: 0.08, amb: 0.15, bio: 3,   desc: 'Highlights bioluminescent life' }
+    ];
+    const buttons = []; let hovered = null;
+    const paint = b => b.setAttribute('material', 'color',
+      (b.act === 'f' + S.mode) || (b.act === 'lights' && S.lights) ? '#0b8aa6' : b === hovered ? '#0d5568' : '#06303d');
+    const button = (p, label, x, y, w, act) => {
+      const b = E(p, 'a-plane', { class: 'clickable', width: w, height: 0.14, position: `${x} ${y} 0.008`, material: 'shader: flat; color: #06303d' });
+      b.act = act; b.t = T(b, label, 0, 0, { w: w * 0.92, wrap: (w * 0.92) / 0.028, a: 'center', c: '#e8fdff' });
+      b.addEventListener('click', () => { doAction(act); buzz(rhand, 0.5, 40); });
+      b.addEventListener('mouseenter', () => { hovered = b; paint(b); buzz(rhand, 0.15, 15); });   // fired by raycaster cursor
+      b.addEventListener('mouseleave', () => { hovered = null; paint(b); });
+      buttons.push(b); return b;
+    };
+    MODES.forEach((m, i) => button(fp, m.name, -0.66 + i * 0.44, 0.0, 0.42, 'f' + i));
+    button(fp, 'Lights on', -0.58, -0.18, 0.56, 'lights'); button(fp, 'Sonar ping', 0, -0.18, 0.56, 'ping'); button(fp, 'Reset rover', 0.58, -0.18, 0.56, 'reset');
+
+    /* ---------- Head-locked overlay + mini status strip (children of #camera) ---------- */
+    const overlay = E(cam, 'a-plane', { width: 3, height: 3, position: '0 0 -0.4', visible: false,
+      material: 'shader: feedfx; transparent: true; depthTest: false; depthWrite: false; side: double' });
+    overlay.addEventListener('loaded', () => { const m = overlay.getObject3D('mesh'); m.renderOrder = 999; m.frustumCulled = false; });
+    const strip = E(cam, 'a-entity', { position: '0 -0.27 -0.8', text: { value: '', width: 0.7, wrapCount: 40, align: 'center', color: '#8fe3f2', font: 'sourcecodepro', opacity: 0.85 } });
+
+    /* ---------- Actions ---------- */
+    const setMode = i => {
+      S.mode = (i + MODES.length) % MODES.length; const m = MODES[S.mode];
+      overlay.setAttribute('visible', m.str > 0);
+      overlay.setAttribute('material', { tint: m.tint, strength: m.str, mode: m.k });
+      scene.setAttribute('fog', { type: 'exponential', color: m.fog, density: m.dens });  // exponential fog per brief
+      amb.setAttribute('light', 'intensity', m.amb);
+      bio.forEach(s => s.pts.material.opacity = Math.min(1, s.base * m.bio));
+      jellyMats.forEach(j => j.opacity = Math.min(1, j.userData.base * (0.5 + 0.5 * m.bio)));
+      buttons.forEach(paint);
+    };
+    const ping = () => { const r = rings.find(r => r.age < 0) || rings[0]; r.age = 0; };
+    const doAction = a => {
+      if (a[0] === 'f') setMode(+a[1]);
+      else if (a === 'lights') { S.lights = !S.lights; lamps.forEach(l => l.setAttribute('visible', S.lights));
+        lamps.forEach(l => l.components.light && l.setAttribute('light', 'intensity', S.lights ? 2.4 : 0));
+        setText(buttons.find(b => b.act === 'lights').t, S.lights ? 'Lights on' : 'Lights off'); buttons.forEach(paint); }
+      else if (a === 'ping') ping();
+      else if (a === 'reset') { S.yaw = 0; S.elev = 0; }
+    };
+    const buzz = (el, s, ms) => { try { el.components['tracked-controls'].controller.gamepad.hapticActuators[0].pulse(s, ms); } catch (e) {} };
+
+    /* ---------- CONTROLLER EVENT LISTENERS (Quest 3S / Touch) ---------- */
+    // Left thumbstick: smooth locomotion on the platform. Event detail is {x, y}; y is negative when pushed forward.
+    lhand.addEventListener('thumbstickmoved', e => { S.lx = e.detail.x; S.ly = e.detail.y; });
+    // Right thumbstick: x turns the rover, y raises/lowers it (changes depth reading).
+    rhand.addEventListener('thumbstickmoved', e => { S.rx = e.detail.x; S.ry = e.detail.y; });
+    // Right trigger: handled by cursor (downEvents: triggerdown) which emits "click" on the .clickable button under the laser.
+    // Right grip: cycle camera filter. A: sonar ping. B: spotlights. Left Y: show/hide console.
+    rhand.addEventListener('gripdown',    () => { setMode(S.mode + 1); buzz(rhand, 0.6, 50); });
+    rhand.addEventListener('abuttondown', () => { ping(); buzz(rhand, 0.3, 30); });
+    rhand.addEventListener('bbuttondown', () => doAction('lights'));
+    lhand.addEventListener('ybuttondown', () => { S.hud = !S.hud; app.querySelectorAll('[data-console]').forEach(e => e.setAttribute('visible', S.hud)); });
+    // Desktop fallback keys: 1-4 filters, P ping, L lights, X reset, Z/C turn rover, Q/E raise/lower. WASD + mouse via A-Frame.
+    const K = {};
+    addEventListener('keydown', e => { const k = e.key.toLowerCase(); K[k] = 1;
+      if (k >= '1' && k <= '4') setMode(+k - 1); if (k === 'p') ping(); if (k === 'l') doAction('lights'); if (k === 'x') doAction('reset'); });
+    addEventListener('keyup', e => delete K[e.key.toLowerCase()]);
+    scene.addEventListener('enter-vr', () => { const h = $('#hint'); if (h) h.hidden = true; });
+
+    setMode(0);
+    if (scene.components.raycaster) scene.components.raycaster.refreshObjects();
+
+    /* ============================================================
+       3. ANIMATION LOOP (called every frame from tick)
+       ============================================================ */
+    const dead = v => Math.abs(v) < 0.15 ? 0 : v;
+    const dir = new THREE.Vector3(); let hudT = 0;
+    this.loop = (t, dtMs) => {
+      const dt = Math.min(dtMs, 100) / 1000;
+
+      // a) Smooth locomotion relative to where the head faces, clamped to the platform area.
+      const mx = dead(S.lx), mz = -dead(S.ly);
+      if (mx || mz) {
+        cam.object3D.getWorldDirection(dir);                    // +Z axis of the head; forward is the opposite
+        let fx = -dir.x, fz = -dir.z; const l = Math.hypot(fx, fz) || 1; fx /= l; fz /= l;
+        rig.object3D.position.x += (fx * mz - fz * mx) * 2 * dt;
+        rig.object3D.position.z += (fz * mz + fx * mx) * 2 * dt;
+      }
+      const rp = rig.object3D.position, rl = Math.hypot(rp.x, rp.z); if (rl > 5) { rp.x *= 5 / rl; rp.z *= 5 / rl; }
+
+      // b) Rover control: yaw + elevation from right stick (or keys), simulated descent to 4,200 m.
+      const rx = dead(S.rx) || ((K.c ? 1 : 0) - (K.z ? 1 : 0)), ry = dead(S.ry) || ((K.e ? 1 : 0) - (K.q ? 1 : 0));
+      S.yaw -= rx * 1.1 * dt; S.elev = Math.max(-0.8, Math.min(3.2, S.elev - ry * 1.2 * dt));
+      if (S.baseDepth < 4200) S.baseDepth = Math.min(4200, S.baseDepth + 36 * dt);
+      S.depth = S.baseDepth - S.elev + Math.sin(t / 900) * 0.04;
+      S.link = 300 + 40 * Math.sin(t / 700) + Math.random() * 8;
+      rover.object3D.position.y = 2.2 + S.elev + Math.sin(t / 1300) * 0.06;
+      rover.object3D.rotation.set(0, S.yaw, Math.sin(t / 1700) * 0.03);
+
+      // c) Particles: wrap vertically, drift sideways.
+      sets.forEach(s => { const p = s.pos;
+        if (s.follow) { const f = s.follow, r0 = rover.object3D.position; s.pts.position.set(r0.x, f.y !== undefined ? f.y : r0.y, r0.z + (f.dz || 0)); }
+        for (let i = 0; i < s.n; i++) { const j = i * 3;
+          p[j + 1] += s.vy * dt; p[j] += Math.sin(t * 0.0007 + i) * s.wob * dt;
+          if (p[j + 1] > s.h / 2) p[j + 1] -= s.h; else if (p[j + 1] < -s.h / 2) p[j + 1] += s.h; }
+        s.geo.attributes.position.needsUpdate = true; });
+      bio.forEach(s => s.pts.scale.setScalar(1 + Math.sin(t / 600) * 0.12));   // gentle glow pulse
+
+      // c2) Marine life + rover blob shadow (shrinks and fades as the rover rises off the seabed).
+      lifeTick.forEach(f => f(t));
+      const rh = rover.object3D.position.y; shadow.position.x = rover.object3D.position.x; shadow.position.z = rover.object3D.position.z;
+      shadow.scale.setScalar(1 + rh * 0.25); shadow.material.opacity = 0.75 / (1 + Math.max(0, rh - 1.2) * 0.35);
+
+      // d) Sonar: rotating sweep, expanding ping rings (auto-ping every 5 s), blips light up when a ring crosses them.
+      sweep.object3D.rotation.z -= 1.57 * dt;
+      if ((t % 5000) < dtMs) ping();
+      const cy = Math.cos(S.yaw), sy = Math.sin(S.yaw);
+      rings.forEach(r => { if (r.age < 0) return; r.age += dt; const k = r.age / 2.6;
+        if (k >= 1) { r.age = -1; r.setAttribute('visible', false); return; }
+        r.setAttribute('visible', true); r.object3D.scale.setScalar(Math.max(0.01, k * 0.4)); r.setAttribute('material', 'opacity', (1 - k) * 0.8); r.k = k; });
+      blips.forEach(b => {
+        const rx2 = b.f.x - rover.object3D.position.x, rz2 = b.f.z - rover.object3D.position.z;
+        const lx = rx2 * cy - rz2 * sy, lz = rx2 * sy + rz2 * cy, d = Math.hypot(lx, lz) / RANGE;   // rover-relative
+        b.object3D.position.set(lx / RANGE * 0.4, -lz / RANGE * 0.4, 0.003);
+        rings.forEach(r => { if (r.age >= 0 && Math.abs(d - r.k) < 0.06) b.hit = t; });
+        b.setAttribute('material', 'opacity', d > 1 ? 0 : Math.max(0, 1 - (t - b.hit) / 3000));
+      });
+
+      // e) HUD text refresh (~8 Hz to stay cheap).
+      hudT += dtMs; if (hudT < 120) return; hudT = 0;
+      const depthStr = Math.round(S.depth).toLocaleString('en-US'), bars = S.depth / 10 + 1.01;
+      const head = String(Math.round(((-S.yaw * 180 / Math.PI) % 360 + 360) % 360)).padStart(3, '0');
+      setText(tDepth, depthStr + ' m');
+      setText(tPress, bars.toFixed(1) + ' bar  ' + Math.round(bars * 14.5038).toLocaleString('en-US') + ' psi');
+      setText(tHead, 'Heading ' + head + '\u00b0   Elev ' + (S.elev >= 0 ? '+' : '') + S.elev.toFixed(1) + ' m');
+      setText(tStat, (S.baseDepth < 4200 ? 'Descending' : 'On station') + '   Link ' + Math.round(S.link) + ' ms');
+      setBar(bDepth, S.depth / 4200); setBar(bPress, bars / 430);
+      setText(tFeed, 'CAM-2  ' + MODES[S.mode].name + '  24 fps');
+      setText(tDesc, MODES[S.mode].desc);
+      strip.setAttribute('text', 'value', depthStr + ' m   ' + bars.toFixed(0) + ' bar   ' + MODES[S.mode].name);
+    };
+    // Tag the cockpit parts so the left Y button can hide them.
+    [tp, sp, fp].forEach(e => e.setAttribute('data-console', ''));
+  },
+  tick: function (t, dt) { if (this.loop) this.loop(t, dt); }
+});
+</script>
+</head>
+<body>
+<div id="hint">Desktop: WASD + mouse to move and look, click buttons. 1-4 filters, P ping, L lights, Z/C turn rover, Q/E raise/lower, X reset. VR: press Enter VR.</div>
+
+<!-- Scene-level cursor/raycaster = mouse picking on desktop. In VR the right controller's own cursor takes over. -->
+<a-scene
+  renderer="antialias: true; foveationLevel: 1"
+  fog="type: exponential; color: #00121e; density: 0.08"
+  cursor="rayOrigin: mouse; fuse: false"
+  raycaster="objects: .clickable"
+  background="color: #00121e">
+
+  <a-entity abyss></a-entity>
+
+  <!-- Player rig: platform top is y=0.2. wasd-controls = desktop fallback; custom thumbstick locomotion lives in the abyss component. -->
+  <a-entity id="rig" position="0 0.2 0" wasd-controls="acceleration: 25">
+    <a-entity id="camera" camera look-controls position="0 1.6 0"></a-entity>
+
+    <!-- Left hand: smooth locomotion (thumbstick) + Y toggles console -->
+    <a-entity id="lhand" oculus-touch-controls="hand: left; model: true"></a-entity>
+
+    <!-- Right hand: laser pointer. downEvents/upEvents map the trigger to mouse-style clicks on .clickable HUD buttons. -->
+    <a-entity id="rhand" oculus-touch-controls="hand: right; model: true"
+              raycaster="objects: .clickable; far: 8; showLine: true; lineColor: #66f6ff; lineOpacity: 0.8"
+              cursor="rayOrigin: entity; fuse: false; downEvents: triggerdown; upEvents: triggerup"></a-entity>
+  </a-entity>
+</a-scene>
+</body>
+</html>
